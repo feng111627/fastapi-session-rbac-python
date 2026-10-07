@@ -10,7 +10,16 @@ from app.config import Settings
 from app.deps import scopes_for_roles
 from app.errors import AuthError, Reason, StorageError
 from app.ratelimit import RateLimiter
-from app.storage import RotateStatus, SessionRecord, Store
+from app.storage import (
+    REASON_ABSOLUTE,
+    REASON_IDLE,
+    REASON_LOGOUT,
+    REASON_USER_REVOKE,
+    RotateStatus,
+    SessionRecord,
+    SessionState,
+    Store,
+)
 from app.tokens import hash_refresh_token, issue_access_token, new_refresh_token
 from app.users import UserRepo, verify_password
 
@@ -94,6 +103,14 @@ class AuthService:
             raise AuthError(Reason.REFRESH_REUSE_DETECTED)
         if result.status is RotateStatus.EXPIRED:
             raise AuthError(Reason.TOKEN_EXPIRED)
+        if result.status is RotateStatus.SESSION_EXPIRED:
+            log.info("refresh rejected: session %s reached absolute lifetime",
+                     session.session_id if session else "?")
+            raise AuthError(Reason.SESSION_EXPIRED)
+        if result.status is RotateStatus.SESSION_IDLE:
+            log.info("refresh rejected: session %s idle too long",
+                     session.session_id if session else "?")
+            raise AuthError(Reason.SESSION_IDLE)
         if result.status is RotateStatus.SESSION_REVOKED:
             raise AuthError(Reason.SESSION_REVOKED)
         raise AuthError(Reason.TOKEN_INVALID)  # NOT_FOUND
@@ -103,13 +120,62 @@ class AuthService:
         if not refresh_token:
             raise AuthError(Reason.TOKEN_MISSING)
         try:
-            self._store.revoke_session_by_token(hash_refresh_token(refresh_token), "logout")
+            self._store.revoke_session_by_token(
+                hash_refresh_token(refresh_token), REASON_LOGOUT,
+            )
+        except StorageError as exc:
+            raise _storage_fail(exc) from exc
+
+    def authorize_session(self, session_id: str) -> SessionRecord:
+        """Validate an access request against session lifecycle state.
+
+        Applies lazy idle/absolute expiry for this session, records the
+        activity (sliding the idle window), and raises with a reason that
+        distinguishes revoked / idle / absolute-expired.
+        """
+        now = time.time()
+        try:
+            session = self._store.get_session(session_id)
+            if session is None:
+                raise AuthError(Reason.TOKEN_REVOKED)
+            if not session.revoked:
+                if session.expires_at <= now:
+                    self._store.mark_session_dead(session.session_id, REASON_ABSOLUTE, now)
+                    raise AuthError(Reason.SESSION_EXPIRED)
+                if session.last_active_at + session.idle_timeout <= now:
+                    self._store.mark_session_dead(session.session_id, REASON_IDLE, now)
+                    raise AuthError(Reason.SESSION_IDLE)
+                # active use keeps the idle window fresh (monotonic)
+                self._store.touch_session(session.session_id, now)
+            else:
+                if session.state is SessionState.IDLE:
+                    raise AuthError(Reason.SESSION_IDLE)
+                if session.state is SessionState.EXPIRED:
+                    raise AuthError(Reason.SESSION_EXPIRED)
+                raise AuthError(Reason.TOKEN_REVOKED)
+            return session
         except StorageError as exc:
             raise _storage_fail(exc) from exc
 
     def list_sessions(self, username: str) -> list[SessionRecord]:
+        """Return the user's visible sessions, applying lifecycle first.
+
+        Due idle/absolute sessions are marked dead, and dead sessions past the
+        retention window are physically purged (with their credentials), so the
+        active list never accumulates dead rows.
+        """
         try:
+            self._store.expire_due_sessions()
+            self._store.purge_dead_sessions(self._settings.dead_session_retain_seconds)
             return self._store.list_sessions(username)
+        except StorageError as exc:
+            raise _storage_fail(exc) from exc
+
+    def run_session_maintenance(self) -> None:
+        """Explicit lazy maintenance: expire due sessions then purge old dead."""
+        try:
+            self._store.expire_due_sessions()
+            self._store.purge_dead_sessions(self._settings.dead_session_retain_seconds)
         except StorageError as exc:
             raise _storage_fail(exc) from exc
 
@@ -119,26 +185,54 @@ class AuthService:
             if rec is None or rec.username != username:
                 # do not reveal existence of other users' sessions
                 raise AuthError(Reason.SESSION_REVOKED, status_code=404)
-            self._store.revoke_session(session_id, "revoked_by_user")
+            self._store.revoke_session(session_id, REASON_USER_REVOKE)
+        except StorageError as exc:
+            raise _storage_fail(exc) from exc
+
+    def logout_other_devices(
+        self, username: str, current_session_id: str, *, include_current: bool = False,
+    ) -> int:
+        """Revoke the user's other devices (or all devices) atomically.
+
+        The revocation and credential deletion share one transaction with any
+        concurrent refresh (store-level lock), so a racing refresh either
+        commits before the revoke (and is then revoked anyway) or is rejected;
+        there is no outcome where a fresh credential survives the sweep.
+        """
+        try:
+            owner = self._store.get_session(current_session_id)
+            if owner is None or owner.username != username:
+                raise AuthError(Reason.SESSION_REVOKED, status_code=404)
+            return self._store.revoke_other_sessions(
+                username, current_session_id, include_current=include_current,
+            )
         except StorageError as exc:
             raise _storage_fail(exc) from exc
 
     # -- helpers ---------------------------------------------------------------
     def _issue_pair(self, username: str, device: str) -> TokenPair:
         now = time.time()
+        s = self._settings
+        absolute_end = now + s.session_max_lifetime_seconds
         session = SessionRecord(
             session_id=secrets.token_hex(16),
             username=username,
             device=device,
             created_at=now,
-            expires_at=now + self._settings.refresh_token_ttl_seconds,
+            expires_at=absolute_end,
             revoked=False,
             revoke_reason=None,
+            last_active_at=now,
+            idle_timeout=float(s.session_idle_timeout_seconds),
+            max_lifetime=float(s.session_max_lifetime_seconds),
+            revoked_at=None,
         )
         refresh = new_refresh_token()
         self._store.create_session(session)
+        # the first refresh token cannot outlive the session itself
         self._store.store_refresh_token(
-            hash_refresh_token(refresh), session.session_id, now, session.expires_at,
+            hash_refresh_token(refresh), session.session_id, now,
+            min(now + s.refresh_token_ttl_seconds, absolute_end),
         )
         log.info("session %s created for user=%s device=%s", session.session_id, username, device)
         return self._pair_for_session(session, refresh)

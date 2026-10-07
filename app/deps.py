@@ -40,12 +40,11 @@ def get_current_claims(request: Request) -> dict:
     sid = claims.get("sid")
     if not isinstance(sid, str):
         raise AuthError(Reason.TOKEN_INVALID)
+    # one place enforces revoked / idle / absolute-expiry and slides activity
     try:
-        session = request.app.state.store.get_session(sid)
+        request.app.state.auth.authorize_session(sid)
     except StorageError as exc:
         raise AuthError(Reason.STORAGE_UNAVAILABLE, status_code=503) from exc
-    if session is None or session.revoked:
-        raise AuthError(Reason.TOKEN_REVOKED)
     return claims
 
 

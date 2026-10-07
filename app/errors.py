@@ -15,6 +15,8 @@ class Reason(StrEnum):
     TOKEN_REVOKED = "token_revoked"
     TOKEN_INVALID = "token_invalid"
     SESSION_REVOKED = "session_revoked"
+    SESSION_IDLE = "session_idle"  # no activity beyond the idle timeout
+    SESSION_EXPIRED = "session_expired"  # absolute lifetime cap reached
     REFRESH_REUSE_DETECTED = "refresh_reuse_detected"
     INSUFFICIENT_SCOPE = "insufficient_scope"
     BAD_CREDENTIALS = "bad_credentials"

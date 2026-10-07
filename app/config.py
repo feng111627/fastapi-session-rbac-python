@@ -11,6 +11,12 @@ class Settings:
     secret_key: str = "dev-only-insecure-secret-change-me-32b"
     access_token_ttl_seconds: int = 900
     refresh_token_ttl_seconds: int = 7 * 24 * 3600
+    # session lifecycle: idle timeout (sliding) and absolute lifetime cap
+    session_idle_timeout_seconds: int = 30 * 60
+    session_max_lifetime_seconds: int = 7 * 24 * 3600
+    # dead sessions (revoked/expired/idle) are physically purged this long
+    # after they died; before that they stay visible with a terminal status
+    dead_session_retain_seconds: int = 7 * 24 * 3600
     db_path: str = "auth.db"
     issuer: str = "fastapi-session-rbac"
     # progressive rate limiting

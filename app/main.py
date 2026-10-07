@@ -28,10 +28,18 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
+class LogoutOthersRequest(BaseModel):
+    all_devices: bool = False
+
+
 def create_app(settings: Settings | None = None, seed_users: bool = True) -> FastAPI:
     settings = settings or Settings()
     store = Store(settings.db_path)
-    store.init_schema()
+    # migration defaults also cover sessions created before this feature
+    store.init_schema(
+        idle_timeout=float(settings.session_idle_timeout_seconds),
+        max_lifetime=float(settings.session_max_lifetime_seconds),
+    )
     users = UserRepo(store)
     limiter = RateLimiter(store, settings)
     auth = AuthService(settings, store, users, limiter)
@@ -79,12 +87,24 @@ def create_app(settings: Settings | None = None, seed_users: bool = True) -> Fas
 
     @app.get("/auth/sessions")
     def sessions(claims: dict = Depends(get_current_claims)) -> list[dict]:
+        # listing also lazily expires due sessions and purges long-dead ones
         return [
             {"session_id": s.session_id, "device": s.device, "created_at": s.created_at,
-             "expires_at": s.expires_at, "revoked": s.revoked,
+             "expires_at": s.expires_at, "last_active_at": s.last_active_at,
+             "idle_timeout": s.idle_timeout, "max_lifetime": s.max_lifetime,
+             "revoked": s.revoked, "status": s.state.value,
              "revoke_reason": s.revoke_reason}
             for s in auth.list_sessions(claims["sub"])
         ]
+
+    @app.post("/auth/sessions/logout-others", status_code=200)
+    def logout_others(body: LogoutOthersRequest,
+                      claims: dict = Depends(get_current_claims)) -> dict:
+        # the bearer token's own session is the protected "current device"
+        count = auth.logout_other_devices(
+            claims["sub"], claims["sid"], include_current=body.all_devices,
+        )
+        return {"revoked": count}
 
     @app.post("/auth/sessions/{session_id}/revoke", status_code=204)
     def revoke(session_id: str, claims: dict = Depends(get_current_claims)) -> None:
