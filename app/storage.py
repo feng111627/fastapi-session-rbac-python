@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -20,9 +21,21 @@ class SessionRecord:
     username: str
     device: str
     created_at: float
-    expires_at: float
+    expires_at: float  # absolute expiry: session dies here no matter how active
     revoked: bool
     revoke_reason: str | None
+    last_active_at: float = 0.0
+
+
+def session_status(rec: SessionRecord, now: float, idle_timeout: float) -> str:
+    """Derived lifecycle status: revoked / expired / idle_expired / active."""
+    if rec.revoked:
+        return "revoked"
+    if rec.expires_at <= now:
+        return "expired"
+    if idle_timeout > 0 and now - rec.last_active_at >= idle_timeout:
+        return "idle_expired"
+    return "active"
 
 
 @dataclass
@@ -44,6 +57,7 @@ class RotateStatus(StrEnum):
     ALREADY_ROTATED = "already_rotated"  # reuse of an old refresh token
     EXPIRED = "expired"
     SESSION_REVOKED = "session_revoked"
+    IDLE_EXPIRED = "idle_expired"  # no activity within the idle window
 
 
 @dataclass
@@ -65,7 +79,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0,
-    revoke_reason TEXT
+    revoke_reason TEXT,
+    last_active_at REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -98,8 +113,26 @@ class Store:
             self._conn.execute("PRAGMA journal_mode=WAL")
             with self._lock, self._conn:
                 self._conn.executescript(_SCHEMA)
+                self._migrate_locked()
         except sqlite3.Error as exc:
             raise StorageError("failed to initialize storage") from exc
+
+    def _migrate_locked(self) -> None:
+        """Bring pre-upgrade databases forward, keeping existing sessions usable.
+
+        Sessions created before the lifecycle feature have no last_active_at;
+        they are stamped with the migration time so they get a fresh idle
+        window instead of being instantly expired by the upgrade itself.
+        """
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(sessions)")}
+        if "last_active_at" not in cols:
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN last_active_at REAL NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                "UPDATE sessions SET last_active_at=? WHERE last_active_at=0",
+                (time.time(),),
+            )
 
     def close(self) -> None:
         if self._conn is not None:
@@ -143,8 +176,9 @@ class Store:
             with self._lock, self._db() as conn:
                 conn.execute(
                     "INSERT INTO sessions(session_id, username, device, created_at, expires_at, "
-                    "revoked, revoke_reason) VALUES(?,?,?,?,?,0,NULL)",
-                    (rec.session_id, rec.username, rec.device, rec.created_at, rec.expires_at),
+                    "revoked, revoke_reason, last_active_at) VALUES(?,?,?,?,?,0,NULL,?)",
+                    (rec.session_id, rec.username, rec.device, rec.created_at, rec.expires_at,
+                     rec.last_active_at),
                 )
         except sqlite3.Error as exc:
             raise StorageError("failed to create session") from exc
@@ -154,7 +188,7 @@ class Store:
             with self._lock:
                 row = self._db().execute(
                     "SELECT session_id, username, device, created_at, expires_at, revoked, "
-                    "revoke_reason FROM sessions WHERE session_id=?",
+                    "revoke_reason, last_active_at FROM sessions WHERE session_id=?",
                     (session_id,),
                 ).fetchone()
         except sqlite3.Error as exc:
@@ -166,7 +200,8 @@ class Store:
             with self._lock:
                 rows = self._db().execute(
                     "SELECT session_id, username, device, created_at, expires_at, revoked, "
-                    "revoke_reason FROM sessions WHERE username=? ORDER BY created_at",
+                    "revoke_reason, last_active_at FROM sessions WHERE username=? "
+                    "ORDER BY created_at",
                     (username,),
                 ).fetchall()
         except sqlite3.Error as exc:
@@ -203,11 +238,80 @@ class Store:
         except sqlite3.Error as exc:
             raise StorageError("failed to revoke session") from exc
 
+    def revoke_sessions_for_user(self, username: str, reason: str,
+                                 except_session_id: str | None = None) -> int:
+        """Revoke every live session of a user (optionally sparing one) and
+        delete all their refresh tokens, atomically.
+
+        Serialized with rotate_refresh_token on the same lock, so a session
+        caught by this operation can never mint a usable token afterwards:
+        either the rotation committed first (and its new token is deleted
+        here) or the revocation committed first (and the rotation then sees
+        the session as revoked).
+        """
+        try:
+            with self._lock, self._db() as conn:
+                rows = conn.execute(
+                    "SELECT session_id FROM sessions WHERE username=? AND revoked=0 "
+                    "AND (? IS NULL OR session_id != ?)",
+                    (username, except_session_id, except_session_id),
+                ).fetchall()
+                ids = [r[0] for r in rows]
+                for sid in ids:
+                    conn.execute(
+                        "UPDATE sessions SET revoked=1, revoke_reason=? WHERE session_id=?",
+                        (reason, sid),
+                    )
+                    conn.execute("DELETE FROM refresh_tokens WHERE session_id=?", (sid,))
+                return len(ids)
+        except sqlite3.Error as exc:
+            raise StorageError("failed to revoke sessions") from exc
+
+    def touch_session_activity(self, session_id: str, now: float) -> None:
+        """Record activity on a live session; never resurrects a revoked one."""
+        try:
+            with self._lock, self._db() as conn:
+                conn.execute(
+                    "UPDATE sessions SET last_active_at=? WHERE session_id=? AND revoked=0",
+                    (now, session_id),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError("failed to touch session") from exc
+
+    def purge_terminal_sessions(self, now: float, idle_timeout: float,
+                                retention: float) -> int:
+        """Delete sessions (and their tokens) that have been terminal for
+        longer than `retention`, plus any expired refresh tokens.
+
+        A session that just rotated successfully cannot match any purge
+        condition: rotation requires expires_at > now and stamps
+        last_active_at = now, and both operations share this lock.
+        """
+        try:
+            with self._lock, self._db() as conn:
+                rows = conn.execute(
+                    "SELECT session_id FROM sessions WHERE "
+                    "(revoked = 1 AND last_active_at + ? < ?) "
+                    "OR (expires_at + ? < ?) "
+                    "OR (revoked = 0 AND last_active_at + ? + ? < ?)",
+                    (retention, now, retention, now, idle_timeout, retention, now),
+                ).fetchall()
+                ids = [r[0] for r in rows]
+                for sid in ids:
+                    conn.execute("DELETE FROM refresh_tokens WHERE session_id=?", (sid,))
+                    conn.execute("DELETE FROM sessions WHERE session_id=?", (sid,))
+                # expired token hashes are useless even for reuse detection
+                conn.execute("DELETE FROM refresh_tokens WHERE expires_at <= ?", (now,))
+                return len(ids)
+        except sqlite3.Error as exc:
+            raise StorageError("failed to purge sessions") from exc
+
     @staticmethod
     def _to_session(row: tuple) -> SessionRecord:
         return SessionRecord(
             session_id=row[0], username=row[1], device=row[2], created_at=row[3],
             expires_at=row[4], revoked=bool(row[5]), revoke_reason=row[6],
+            last_active_at=row[7],
         )
 
     # -- refresh tokens ------------------------------------------------------
@@ -224,12 +328,14 @@ class Store:
             raise StorageError("failed to store refresh token") from exc
 
     def rotate_refresh_token(self, old_hash: str, new_hash: str, now: float,
-                             new_expires_at: float) -> RotateResult:
+                             new_expires_at: float,
+                             idle_timeout: float | None = None) -> RotateResult:
         """Atomically rotate a refresh token.
 
         Exactly one concurrent caller can win the UPDATE on the un-rotated row;
         any other presentation of the same (already rotated) token is reported
-        as ALREADY_ROTATED, i.e. token reuse.
+        as ALREADY_ROTATED, i.e. token reuse. A successful rotation also counts
+        as session activity and slides the idle window forward.
         """
         try:
             with self._lock, self._db() as conn:
@@ -246,8 +352,11 @@ class Store:
                     return RotateResult(RotateStatus.ALREADY_ROTATED, session)
                 if session is None or session.revoked:
                     return RotateResult(RotateStatus.SESSION_REVOKED, session)
-                if expires_at <= now or (session and session.expires_at <= now):
+                if expires_at <= now or session.expires_at <= now:
                     return RotateResult(RotateStatus.EXPIRED, session)
+                if (idle_timeout is not None and idle_timeout > 0
+                        and now - session.last_active_at >= idle_timeout):
+                    return RotateResult(RotateStatus.IDLE_EXPIRED, session)
                 cur = conn.execute(
                     "UPDATE refresh_tokens SET rotated=1 WHERE token_hash=? AND rotated=0",
                     (old_hash,),
@@ -258,6 +367,10 @@ class Store:
                     "INSERT INTO refresh_tokens(token_hash, session_id, expires_at, rotated, "
                     "created_at) VALUES(?,?,?,0,?)",
                     (new_hash, session_id, new_expires_at, now),
+                )
+                conn.execute(
+                    "UPDATE sessions SET last_active_at=? WHERE session_id=?",
+                    (now, session_id),
                 )
                 return RotateResult(RotateStatus.OK, session)
         except sqlite3.Error as exc:
@@ -273,7 +386,7 @@ class Store:
     def _get_session_locked(self, conn: sqlite3.Connection, session_id: str) -> SessionRecord | None:
         row = conn.execute(
             "SELECT session_id, username, device, created_at, expires_at, revoked, "
-            "revoke_reason FROM sessions WHERE session_id=?",
+            "revoke_reason, last_active_at FROM sessions WHERE session_id=?",
             (session_id,),
         ).fetchone()
         return self._to_session(row) if row else None

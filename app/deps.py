@@ -6,6 +6,7 @@ from collections.abc import Callable
 from fastapi import Depends, Request
 
 from app.errors import AuthError, Reason, StorageError
+from app.storage import session_status
 from app.tokens import decode_access_token
 
 # role -> granted scopes; roles come only from the server-side user store,
@@ -28,7 +29,8 @@ def get_current_claims(request: Request) -> dict:
     """Validate the bearer token and the underlying session.
 
     Raises AuthError with distinguishable reasons for missing / malformed /
-    expired / invalid / revoked credentials.
+    expired / invalid / revoked / idle-expired credentials. A successful
+    validation counts as session activity and slides the idle window.
     """
     header = request.headers.get("authorization")
     if header is None:
@@ -40,12 +42,24 @@ def get_current_claims(request: Request) -> dict:
     sid = claims.get("sid")
     if not isinstance(sid, str):
         raise AuthError(Reason.TOKEN_INVALID)
+    store = request.app.state.store
     try:
-        session = request.app.state.store.get_session(sid)
+        session = store.get_session(sid)
     except StorageError as exc:
         raise AuthError(Reason.STORAGE_UNAVAILABLE, status_code=503) from exc
     if session is None or session.revoked:
         raise AuthError(Reason.TOKEN_REVOKED)
+    settings = request.app.state.settings
+    now = request.app.state.now()
+    status = session_status(session, now, settings.session_idle_timeout_seconds)
+    if status == "expired":
+        raise AuthError(Reason.TOKEN_EXPIRED)
+    if status == "idle_expired":
+        raise AuthError(Reason.SESSION_IDLE_EXPIRED)
+    try:
+        store.touch_session_activity(sid, now)
+    except StorageError as exc:
+        raise AuthError(Reason.STORAGE_UNAVAILABLE, status_code=503) from exc
     return claims
 
 

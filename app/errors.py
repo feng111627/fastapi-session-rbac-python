@@ -15,6 +15,7 @@ class Reason(StrEnum):
     TOKEN_REVOKED = "token_revoked"
     TOKEN_INVALID = "token_invalid"
     SESSION_REVOKED = "session_revoked"
+    SESSION_IDLE_EXPIRED = "session_idle_expired"
     REFRESH_REUSE_DETECTED = "refresh_reuse_detected"
     INSUFFICIENT_SCOPE = "insufficient_scope"
     BAD_CREDENTIALS = "bad_credentials"

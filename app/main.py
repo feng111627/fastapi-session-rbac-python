@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -28,13 +30,14 @@ class RefreshRequest(BaseModel):
     refresh_token: str
 
 
-def create_app(settings: Settings | None = None, seed_users: bool = True) -> FastAPI:
+def create_app(settings: Settings | None = None, seed_users: bool = True,
+               now_fn: Callable[[], float] = time.time) -> FastAPI:
     settings = settings or Settings()
     store = Store(settings.db_path)
     store.init_schema()
     users = UserRepo(store)
     limiter = RateLimiter(store, settings)
-    auth = AuthService(settings, store, users, limiter)
+    auth = AuthService(settings, store, users, limiter, now_fn=now_fn)
 
     app = FastAPI(title="fastapi-session-rbac")
     app.state.settings = settings
@@ -42,6 +45,7 @@ def create_app(settings: Settings | None = None, seed_users: bool = True) -> Fas
     app.state.auth = auth
     app.state.users = users
     app.state.limiter = limiter
+    app.state.now = now_fn
 
     if seed_users:
         # local demo accounts only; no external credentials involved
@@ -81,14 +85,20 @@ def create_app(settings: Settings | None = None, seed_users: bool = True) -> Fas
     def sessions(claims: dict = Depends(get_current_claims)) -> list[dict]:
         return [
             {"session_id": s.session_id, "device": s.device, "created_at": s.created_at,
-             "expires_at": s.expires_at, "revoked": s.revoked,
-             "revoke_reason": s.revoke_reason}
+             "expires_at": s.expires_at, "last_active_at": s.last_active_at,
+             "status": s.status, "revoked": s.revoked, "revoke_reason": s.revoke_reason}
             for s in auth.list_sessions(claims["sub"])
         ]
 
     @app.post("/auth/sessions/{session_id}/revoke", status_code=204)
     def revoke(session_id: str, claims: dict = Depends(get_current_claims)) -> None:
         auth.revoke_session(claims["sub"], session_id)
+
+    @app.post("/auth/sessions/revoke-others", status_code=200)
+    def revoke_others(include_current: bool = False,
+                      claims: dict = Depends(get_current_claims)) -> dict:
+        count = auth.revoke_other_sessions(claims["sub"], claims["sid"], include_current)
+        return {"revoked": count}
 
     # -- protected resources ---------------------------------------------------
     @app.get("/profile")

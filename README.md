@@ -50,6 +50,48 @@ login ──► access_token (JWT, 默认 15min) + refresh_token (不透明随�
 - **重启恢复**：用户、会话、刷新令牌哈希、吊销状态、限流计数全部存于 SQLite
   （WAL 模式），进程重启后已建立的会话与吊销状态原样恢复。
 
+## 会话生命周期
+
+每个会话除了刷新令牌自身的有效期外，还受两条生命周期规则约束（均可配置）：
+
+- **空闲失效（滑动窗口）**：会话记录 `last_active_at`。每次成功的刷新、以及每次
+  持有效访问令牌通过鉴权，都会把活跃时间戳推进到当前时刻，空闲倒计时随之顺延。
+  超过 `session_idle_timeout_seconds`（默认 3 天）没有任何活动，会话连同其凭证
+  一起作废：访问返回 `401 session_idle_expired`，刷新同样返回
+  `401 session_idle_expired`——与 `token_revoked`（主动登出/吊销）、
+  `token_expired`（到期）、`token_invalid`（凭证不合法）可区分，前端可分别处理。
+- **最长存活上限（绝对窗口）**：会话自建立时刻起最多存活
+  `session_max_lifetime_seconds`（默认 30 天）。即使一直规律刷新、空闲窗口不断
+  顺延，到点也会失效：访问与刷新均返回 `401 token_expired`。
+
+### 一键退出其他设备
+
+`POST /auth/sessions/revoke-others`（需登录）把当前账号下**其他设备**的会话一次性
+吊销（`revoke_reason=logout_others`），立即生效；加 `?include_current=true` 则连
+当前设备一起退出（`logout_all`）。该操作与刷新在同一存储锁下串行化：被命中的会话
+要么先完成轮换（新令牌随即被删除），要么先被吊销（轮换随后看到会话已吊销）——
+操作返回后，被清掉的设备不存在任何可用凭证，当前设备也不会被误伤。
+
+### 会话列表与清理
+
+`GET /auth/sessions` 返回每个会话的 `last_active_at` 和派生 `status`
+（`active` / `revoked` / `expired` / `idle_expired`）。已终结的会话在
+`terminated_session_retention_seconds`（默认 1 天）后被清理：会话行与其刷新令牌
+哈希一并删除，过期令牌哈希也一并清除，不会长期堆积。清理在会话列表读取时触发，
+也可由 `AuthService.cleanup_expired()` 主动调用。清理与轮换共享同一把锁，刚刷新
+过的会话（`last_active_at=now` 且未到期）不可能满足任何清理条件，不会被误删。
+
+### 兼容与升级
+
+- 升级前已存在的库在首次启动时自动迁移：`sessions` 表新增 `last_active_at` 列，
+  存量会话的活跃时间被盖戳为迁移时刻（获得一个全新的空闲窗口，不会因升级被立即
+  判为空闲失效），原有 `expires_at` 作为其绝对到期时刻继续生效，刷新令牌、吊销
+  状态、限流计数原样保留。
+- 重启后 `last_active_at`、空闲失效与最长存活状态全部从 SQLite 恢复。
+- 注意：新建会话的绝对有效期现在由 `session_max_lifetime_seconds` 决定（此前
+  等于刷新令牌有效期）；刷新令牌自身有效期仍由 `refresh_token_ttl_seconds`
+  控制，语义不变。
+
 ## 权限模型
 
 角色 → 作用域的映射在服务端固定（`app/deps.py: ROLE_SCOPES`），令牌中的 scopes
@@ -64,6 +106,7 @@ login ──► access_token (JWT, 默认 15min) + refresh_token (不透明随�
 | 端点                            | 所需作用域     |
 |---------------------------------|----------------|
 | GET /profile, GET /auth/sessions | 登录即可 / profile:read |
+| POST /auth/sessions/{id}/revoke, POST /auth/sessions/revoke-others | 登录即可 |
 | GET /reports                    | reports:read   |
 | POST /reports                   | reports:write  |
 | GET /admin/users                | admin:users    |
@@ -84,6 +127,7 @@ login ──► access_token (JWT, 默认 15min) + refresh_token (不透明随�
 | token_expired            | 401  | 令牌已过期                     |
 | token_revoked            | 401  | 所属会话已吊销                 |
 | session_revoked          | 401  | 刷新时会话已被吊销             |
+| session_idle_expired     | 401  | 会话空闲超时被作废             |
 | refresh_reuse_detected   | 401  | 刷新令牌重复使用（会话已吊销） |
 | insufficient_scope       | 403  | 权限不足                       |
 | bad_credentials          | 401  | 用户名或密码错误               |
@@ -96,7 +140,10 @@ login ──► access_token (JWT, 默认 15min) + refresh_token (不透明随�
 |------|------|------|
 | secret_key | dev 值 | JWT HMAC 密钥，生产必须替换 |
 | access_token_ttl_seconds | 900 | 访问令牌有效期 |
-| refresh_token_ttl_seconds | 604800 | 刷新令牌/会话有效期 |
+| refresh_token_ttl_seconds | 604800 | 单个刷新令牌有效期 |
+| session_idle_timeout_seconds | 259200 | 会话空闲失效窗口（滑动，3 天） |
+| session_max_lifetime_seconds | 2592000 | 会话最长存活上限（绝对，30 天） |
+| terminated_session_retention_seconds | 86400 | 终结会话保留时长，逾期被清理 |
 | db_path | auth.db | SQLite 文件路径 |
 | issuer | fastapi-session-rbac | JWT iss |
 | login_fail_free_attempts | 3 | 登录失败宽限次数 |
@@ -119,5 +166,9 @@ uv run pytest -v
 - `tests/test_rbac.py` — 三种角色的权限边界、伪造/篡改令牌、缺失/畸形/过期凭证
 - `tests/test_sessions.py` — 登出立即失效、多设备定向吊销、跨用户吊销拒绝、
   **重启后会话与吊销状态恢复**
+- `tests/test_lifecycle.py` — 空闲失效（访问/刷新均拒绝且原因可区分）、刷新顺延
+  空闲窗口、持续活跃仍在最长存活上限到点失效、**退出其他设备及其与刷新的并发
+  确定性**、会话列表状态展示、清理不误删在用会话、**重启后生命周期状态恢复、
+  升级前旧库自动迁移且存量会话可用**
 - `tests/test_ratelimit.py` — 登录失败递进锁定、成功后重置、刷新异常递进限流
 - `tests/test_storage_failures.py` — 存储异常归一化为 503，不泄露底层细节
